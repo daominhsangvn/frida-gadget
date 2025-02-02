@@ -5,6 +5,7 @@ import shutil
 import subprocess
 from shutil import which
 from pathlib import Path
+import tempfile
 import click
 from androguard.core.apk import APK
 from .logger import logger
@@ -16,7 +17,6 @@ from . import INSTALLED_FRIDA_VERSION
 
 p = Path(__file__)
 ROOT_DIR = p.parent.resolve()
-TEMP_DIR = ROOT_DIR.joinpath('temp')
 FILE_DIR = ROOT_DIR.joinpath('files')
 
 APKTOOL = which("apktool")
@@ -189,7 +189,7 @@ def modify_manifest(decompiled_path):
                             ':extractNativeLibs="true"')
     android_manifest.write_text(txt, encoding="utf-8")
 
-def inject_gadget_into_apk(apk_path:str, arch:str, decompiled_path:str, no_res, main_activity:str = None, config:str = None, custom_gadget_name:str = None):
+def inject_gadget_into_apk(apk_path:str, arch:str, decompiled_path:str, no_res, main_activity:str = None, config:str = None, script:str = None, custom_gadget_name:str = None):
     """Inject frida gadget into an APK
 
     Args:
@@ -254,7 +254,7 @@ def inject_gadget_into_apk(apk_path:str, arch:str, decompiled_path:str, no_res, 
 
 
     # Upload gadget config file
-    upload_files = {'config': config}
+    upload_files = {'config': config, 'script': script}
 
     for file_type, file_path in upload_files.items():
         if file_path:
@@ -327,6 +327,14 @@ def detect_adb_arch():
         logger.warning("An unexpected error occurred during architecture detection: %s. Falling back to default: %s", str(e), default_arch)
         return default_arch
 
+def clean_up(decompiled_path:str):
+    """Clean up the temporary directory and the output APK
+
+    Args:
+        decompiled_path (str): decomplied path of apk file
+    """
+    shutil.rmtree(decompiled_path)
+
 def print_version(ctx, _, value):
     """Print version and exit"""
     if not value or ctx.resilient_parsing:
@@ -338,6 +346,7 @@ def print_version(ctx, _, value):
 @click.command()
 @click.option('--arch', default=None, help="Target architecture of the device. (options: arm64, x86_64, arm, x86)")
 @click.option('--config', help="Upload the Frida configuration file.")
+@click.option('--script', help="Upload the Frida script file.")
 @click.option('--custom-gadget-name', default=None, help="Custom name for the Frida gadget.")
 @click.option('--no-res', is_flag=True, help="Do not decode resources.")
 @click.option('--main-activity', default=None, help="Specify the main activity if desired.")
@@ -348,7 +357,7 @@ def print_version(ctx, _, value):
 @click.option('--version', is_flag=True, callback=print_version,
               expose_value=False, is_eager=True, help="Show version and exit.")
 @click.argument('apk_path', type=click.Path(exists=True), required=True)
-def run(apk_path: str, arch: str, config: str, no_res:bool, main_activity: str,
+def run(apk_path: str, arch: str, config: str, script: str, no_res:bool, main_activity: str,
         sign:bool, custom_gadget_name:str, skip_decompile:bool, skip_recompile:bool, use_aapt2:bool):
     """Patch an APK with the Frida gadget library"""
     apk_path = Path(apk_path)
@@ -372,52 +381,54 @@ def run(apk_path: str, arch: str, config: str, no_res:bool, main_activity: str,
         )
         sys.exit(-1)
 
-    # Make temp directory for decompile
-    decompiled_path = TEMP_DIR.joinpath(str(apk_path.resolve())[:-4])
-    if not skip_decompile:
-        logger.debug('Decompiling the target APK using apktool\n"%s"', decompiled_path)
-        if decompiled_path.exists():
-            shutil.rmtree(decompiled_path)
-        decompiled_path.mkdir()
+    # Create temp directory for decompile using system temp directory
+    with tempfile.TemporaryDirectory() as temp_dir:
+        decompiled_path = Path(temp_dir) / apk_path.stem
+        if not skip_decompile:
+            logger.debug('Decompiling the target APK using apktool\n"%s"', decompiled_path)
+            decompiled_path.mkdir(exist_ok=True)
 
-        # APK decompile with apktool
-        decompile_option = ['d', '-o', str(decompiled_path.resolve()), '-f']
-        if no_res:
-            decompile_option += ['--no-res']
-        run_apktool(decompile_option, str(apk_path.resolve()))
-    else:
-        if not decompiled_path.exists():
-            logger.error("Decompiled directory not found: %s", decompiled_path)
-            sys.exit(-1)
-
-    # Process if decompile is success
-    inject_gadget_into_apk(apk_path, arch, decompiled_path, no_res, main_activity, config, custom_gadget_name)
-
-    # Rebuild with apktool, print apk_path if process is success
-    if not skip_recompile:
-        logger.debug('Recompiling the new APK using apktool\n"%s"', decompiled_path)
-
-        recompile_option = ['b']
-        if use_aapt2:
-            recompile_option += ['--use-aapt2']
-
-        run_apktool(recompile_option, str(decompiled_path.resolve()))
-        apk_path = decompiled_path.joinpath('dist', apk_path.name)
-        if not apk_path.exists():
-            logger.error("APK not found: %s", apk_path)
+            # APK decompile with apktool
+            decompile_option = ['d', '-o', str(decompiled_path.resolve()), '-f']
+            if no_res:
+                decompile_option += ['--no-res']
+            run_apktool(decompile_option, str(apk_path.resolve()))
         else:
-            logger.info("Success")
+            if not decompiled_path.exists():
+                logger.error("Decompiled directory not found: %s", decompiled_path)
+                sys.exit(-1)
 
-        if sign:
-            logger.debug('Starting APK signing using uber-apk-signer')
-            sign_apk(str(apk_path))
-            return
+        # Process if decompile is success
+        inject_gadget_into_apk(apk_path, arch, decompiled_path, no_res, main_activity, config, script, custom_gadget_name)
 
-    logger.info(apk_path)
-    logger.warning(
-        "The APK is not signed. Use the --sign option to sign it automatically, "
-        "or sign the APK manually before installing it."
-    )
+        # Rebuild with apktool, print apk_path if process is success
+        if not skip_recompile:
+            logger.debug('Recompiling the new APK using apktool\n"%s"', decompiled_path)
+
+            recompile_option = ['b']
+            if use_aapt2:
+                recompile_option += ['--use-aapt2']
+
+            run_apktool(recompile_option, str(decompiled_path.resolve()))
+            output_apk = decompiled_path.joinpath('dist', apk_path.name)
+            if not output_apk.exists():
+                logger.error("APK not found: %s", output_apk)
+            else:
+                # Copy the output APK to same directory as input APK
+                final_apk = apk_path.parent / f"{apk_path.stem}_patched.apk"
+                shutil.copy2(output_apk, final_apk)
+                logger.info("Success")
+
+                if sign:
+                    logger.debug('Starting APK signing using uber-apk-signer')
+                    sign_apk(str(final_apk))
+                    return
+
+                logger.info(final_apk)
+                logger.warning(
+                    "The APK is not signed. Use the --sign option to sign it automatically, "
+                    "or sign the APK manually before installing it."
+                )
 
 
 if __name__ == '__main__':

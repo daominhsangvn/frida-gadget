@@ -129,6 +129,17 @@ How to know device architecture?
 | - Older or lower-end devices might use ``armeabi-v7a``.
 | - Some specific emulators or devices may still use ``x86``.
 
+Developing
+-----------------
+1. Build the package
+```
+rm -rf dist/* && python setup.py sdist
+```
+2. Install the package
+```
+pip install dist/frida_gadget-x.x.x.tar.gz
+```
+
 Contributing
 -----------------
 .. image:: CONTRIBUTORS.svg
